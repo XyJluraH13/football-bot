@@ -26,9 +26,9 @@ MAX_MINUTE = 65          # не позже 65-й минуты
 MIN_TEAM_PRESSURE = 4.0  # минимальный live-индекс моментов у команды, которая может забить
 PREMATCH_WEIGHT = 0.08   # вклад предматчевого прогноза (0..100% -> 0..8 баллов)
 MAX_RESULTS = 3
-SHOW_MIN_ON_TARGET = 6   # команда /matches: показывать матчи, где ударов в створ БОЛЬШЕ этого числа (всего по обеим командам)
-SHOW_TOP = 5
-MAX_STATS_CALLS = 40     # лимит запросов статистики за один вызов /matches
+SHOW_TOP = 5            # команда /matches: сколько матчей со статистикой показать (по ударам в створ)
+MAX_STATS_CALLS = 20     # лимит запросов статистики за один вызов /matches
+MAX_UNLINKED_SHOWN = 10  # сколько "не найденных в API-Football" матчей показать для диагностики
 SCAN_INTERVAL = 90       # пауза между проверками (сек), чтобы не выжигать лимит API
 MAX_SCAN_MINUTES = 180   # через сколько минут непрерывного поиска остановиться само
 TOP_LEAGUE_IDS = {2, 3, 848, 39, 140, 135, 78, 61, 88, 94}
@@ -171,6 +171,16 @@ def load_fonbet_live_football():
     return result
 
 
+def best_candidate(fb, fixtures):
+    """Ближайший по названиям матч API-Football (без учёта счёта и минуты) — для диагностики."""
+    best, best_score = None, 0.0
+    for fx in fixtures:
+        score = (name_sim(fx["home"], fb["home"]) + name_sim(fx["away"], fb["away"])) / 2
+        if score > best_score:
+            best, best_score = fx, score
+    return best, best_score
+
+
 def find_fixture_for_fb(fb, fixtures):
     """Ищет в live-списке API-Football матч, соответствующий матчу Фонбета (только ради статистики)."""
     best, best_score = None, 0.0
@@ -190,31 +200,57 @@ def find_fixture_for_fb(fb, fixtures):
 
 
 # ---------------------------------------------------------------- API-Football
+last_api_error = ""
+
+
+def _num(v):
+    try:
+        return float(str(v).replace("%", ""))
+    except Exception:
+        return 0.0
+
+
 def get_team_statistics(fixture_id, home_id, away_id):
-    """Live-статистика отдельно по каждой команде."""
-    empty = lambda: {"on_target": 0, "shots": 0, "inside_box": 0, "corners": 0}
-    out = {"home": empty(), "away": empty()}
+    """Live-статистика отдельно по каждой команде. out['ok'] = True, если API вернул данные."""
+    global last_api_error
+    empty = lambda: {"on_target": 0, "shots": 0, "inside_box": 0, "corners": 0,
+                     "possession": 0, "xg": 0.0, "yellow": 0, "red": 0}
+    out = {"home": empty(), "away": empty(), "ok": False}
     try:
         res = requests.get(f"{API_HOST}/fixtures/statistics", headers=HEADERS,
                            params={"fixture": fixture_id}, timeout=10).json()
+        errs = res.get("errors")
+        if errs:
+            last_api_error = str(errs)[:200]
+            print(f"API-Football errors: {errs}")
         for team_stat in res.get("response", []):
             tid = team_stat.get("team", {}).get("id")
             side = "home" if tid == home_id else "away" if tid == away_id else None
             if not side:
                 continue
+            out["ok"] = True
             for item in team_stat.get("statistics", []):
                 t, val = item.get("type"), item.get("value")
                 if not val:
                     continue
                 if t == "Shots on Goal":
-                    out[side]["on_target"] += to_int(val)
+                    out[side]["on_target"] = int(_num(val))
                 elif t == "Total Shots":
-                    out[side]["shots"] += to_int(val)
+                    out[side]["shots"] = int(_num(val))
                 elif t == "Shots insidebox":
-                    out[side]["inside_box"] += to_int(val)
+                    out[side]["inside_box"] = int(_num(val))
                 elif t == "Corner Kicks":
-                    out[side]["corners"] += to_int(val)
+                    out[side]["corners"] = int(_num(val))
+                elif t == "Ball Possession":
+                    out[side]["possession"] = int(_num(val))
+                elif t == "expected_goals":
+                    out[side]["xg"] = _num(val)
+                elif t == "Yellow Cards":
+                    out[side]["yellow"] = int(_num(val))
+                elif t == "Red Cards":
+                    out[side]["red"] = int(_num(val))
     except Exception as e:
+        last_api_error = str(e)[:200]
         print(f"Ошибка статистики {fixture_id}: {e}")
     return out
 
@@ -405,8 +441,22 @@ def stop_search():
         send_telegram_message("Сейчас поиск не запущен.")
 
 
+def send_chunks(blocks, sep="\n\n"):
+    """Склеивает блоки в сообщения не длиннее лимита Telegram."""
+    cur = ""
+    for blk in blocks:
+        if cur and len(cur) + len(sep) + len(blk) > 3500:
+            send_telegram_message(cur)
+            cur = ""
+        cur = blk if not cur else cur + sep + blk
+    if cur:
+        send_telegram_message(cur)
+
+
 def show_matches():
-    """/matches — что бот видит прямо сейчас: топ матчей по ударам в створ."""
+    """/matches — как Фонбет и API-Football соотносятся: связки, статистика, диагностика."""
+    global last_api_error
+    last_api_error = ""
     try:
         send_telegram_message("🔎 Собираю матчи с Фонбета и статистику...")
         try:
@@ -420,48 +470,79 @@ def show_matches():
             return
 
         fixtures = load_apifootball_live()
-        linked = []
+        linked, unlinked = [], []
         for fb in fb_list:
             fx = find_fixture_for_fb(fb, fixtures)
-            if fx:
-                linked.append((fb, fx))
+            (linked if fx else unlinked).append((fb, fx))
 
         rows = []
         for fb, fx in linked[:MAX_STATS_CALLS]:
             st = get_team_statistics(fx["fid"], fx["home_id"], fx["away_id"])
-            total_ot = st["home"]["on_target"] + st["away"]["on_target"]
-            rows.append({"fb": fb, "st": st, "ot": total_ot})
-
-        shown = [r for r in rows if r["ot"] > SHOW_MIN_ON_TARGET]
-        shown.sort(key=lambda r: r["ot"], reverse=True)
+            ot = st["home"]["on_target"] + st["away"]["on_target"]
+            rows.append({"fb": fb, "fx": fx, "st": st, "ot": ot})
+        with_stats = sorted([r for r in rows if r["st"]["ok"]], key=lambda r: r["ot"], reverse=True)
+        no_stats = [r for r in rows if not r["st"]["ok"]]
 
         send_telegram_message(
-            f"📡 Фонбет, live-футбол: <b>{len(fb_all)}</b>\n"
-            f"До {MAX_MINUTE}-й минуты: <b>{len(fb_list)}</b>\n"
-            f"Найдены в API-Football (есть статистика): <b>{len(linked)}</b>\n"
-            f"С ударами в створ &gt; {SHOW_MIN_ON_TARGET}: <b>{len(shown)}</b>")
+            f"📡 Фонбет, live-футбол: <b>{len(fb_all)}</b> (до {MAX_MINUTE}-й минуты: <b>{len(fb_list)}</b>)\n"
+            f"⚽️ В API-Football live-матчей: <b>{len(fixtures)}</b>\n"
+            f"🔗 Сопоставлено: <b>{len(linked)}</b> | не найдено: <b>{len(unlinked)}</b>\n"
+            f"📊 Статистика получена: <b>{len(with_stats)}</b> из {len(rows)} запрошенных"
+            + (f"\n⚠️ Ответ API: <code>{html.escape(last_api_error)}</code>" if last_api_error else ""))
 
-        if not shown:
-            send_telegram_message(f"Матчей с более чем {SHOW_MIN_ON_TARGET} ударами в створ сейчас нет.")
-            return
-
-        for r in shown[:SHOW_TOP]:
-            fb, st = r["fb"], r["st"]
+        # Связанные матчи со статистикой — топ по ударам в створ (без порога)
+        for r in with_stats[:SHOW_TOP]:
+            fb, fx, st = r["fb"], r["fx"], r["st"]
             h, a = st["home"], st["away"]
             home = html.escape(translate_name(fb["home"]))
             away = html.escape(translate_name(fb["away"]))
             send_telegram_message(
                 f"⚽️ <b>{home}</b> — <b>{away}</b>\n"
                 f"🏆 {html.escape(fb['league'])}\n"
-                f"⏱ {fb['minute']}' | Счёт: <b>{fb['hg']}:{fb['ag']}</b>\n\n"
-                f"🎯 В створ: <b>{h['on_target']}</b> : <b>{a['on_target']}</b> (всего {r['ot']})\n"
+                f"⏱ Фонбет: {fb['minute']}' {fb['hg']}:{fb['ag']} | "
+                f"API: {fx['elapsed']}' {fx['hg']}:{fx['ag']}\n"
+                f"🔗 API-Football: {html.escape(fx['home'])} — {html.escape(fx['away'])}\n\n"
+                f"🎯 В створ: <b>{h['on_target']}</b> : <b>{a['on_target']}</b>\n"
                 f"💥 Всего ударов: {h['shots']} : {a['shots']}\n"
                 f"🥅 Из штрафной: {h['inside_box']} : {a['inside_box']}\n"
-                f"📐 Угловые: {h['corners']} : {a['corners']}")
+                f"📐 Угловые: {h['corners']} : {a['corners']}\n"
+                f"⚖️ Владение: {h['possession']}% : {a['possession']}%\n"
+                f"📈 xG: {h['xg']:.2f} : {a['xg']:.2f}\n"
+                f"🟨 Жёлтые: {h['yellow']} : {a['yellow']} | 🟥 Красные: {h['red']} : {a['red']}")
+
+        # Сопоставлены, но статистики нет
+        if no_stats:
+            blocks = [f"• {html.escape(r['fb']['home'])} — {html.escape(r['fb']['away'])} "
+                      f"({r['fb']['minute']}')" for r in no_stats]
+            send_chunks(["🚫 <b>Сопоставлены, но API не вернул статистику:</b>\n" + "\n".join(blocks)])
+
+        # Не нашли пару в API-Football — показываем почему
+        if unlinked:
+            lines = []
+            for fb, _ in unlinked[:MAX_UNLINKED_SHOWN]:
+                cand, sc = best_candidate(fb, fixtures)
+                head = (f"• {html.escape(fb['home'])} — {html.escape(fb['away'])} "
+                        f"({fb['minute']}', {fb['hg']}:{fb['ag']})")
+                if cand and sc >= 0.5:
+                    why = []
+                    if (cand["hg"], cand["ag"]) != (fb["hg"], fb["ag"]):
+                        why.append(f"счёт API {cand['hg']}:{cand['ag']}")
+                    if abs(cand["elapsed"] - fb["minute"]) > MINUTE_TOLERANCE:
+                        why.append(f"минута API {cand['elapsed']}'")
+                    if sc < NAME_MATCH_MIN:
+                        why.append("названия слишком разные")
+                    lines.append(f"{head}\n   ≈ {html.escape(cand['home'])} — {html.escape(cand['away'])} "
+                                 f"(сходство {sc:.2f}; {', '.join(why) or 'причина неясна'})")
+                else:
+                    lines.append(f"{head}\n   нет похожих в API-Football (лига может не поддерживаться)")
+            extra = len(unlinked) - MAX_UNLINKED_SHOWN
+            if extra > 0:
+                lines.append(f"…и ещё {extra}")
+            send_chunks(["❓ <b>Не найдены в API-Football:</b>\n" + "\n".join(lines)])
+
         if len(linked) > MAX_STATS_CALLS:
-            send_telegram_message(
-                f"ℹ️ Статистика запрошена только по первым {MAX_STATS_CALLS} матчам из {len(linked)} "
-                "(экономия лимита API).")
+            send_telegram_message(f"ℹ️ Статистика запрошена только по {MAX_STATS_CALLS} из {len(linked)} "
+                                  "сопоставленных матчей (экономия лимита API).")
     except Exception as e:
         print(f"Ошибка /matches: {e}")
         send_telegram_message("⚠️ Ошибка при сборе матчей.")
@@ -508,7 +589,7 @@ def telegram_listener():
                         "👋 Бот готов!\n\nНапишите <b>поиск</b> — найду live-матчи на Фонбете до "
                         f"{MAX_MINUTE}-й минуты и подскажу, какая команда может забить, "
                         "по live-статистике и предматчевому прогнозу. Бот сам проверяет лайв, пока не найдёт матч.\n"
-                        "<b>матчи</b> — показать топ-5 матчей по ударам в створ.\n"
+                        "<b>матчи</b> — показать, как матчи Фонбета сопоставляются со статистикой.\n"
                         "<b>стоп</b> — остановить поиск.\n"
                         "<b>/debug</b> — проверка связи с Фонбетом.")
         except Exception as e:
