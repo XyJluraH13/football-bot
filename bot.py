@@ -26,6 +26,9 @@ MAX_MINUTE = 65          # не позже 65-й минуты
 MIN_TEAM_PRESSURE = 4.0  # минимальный live-индекс моментов у команды, которая может забить
 PREMATCH_WEIGHT = 0.08   # вклад предматчевого прогноза (0..100% -> 0..8 баллов)
 MAX_RESULTS = 3
+SHOW_MIN_ON_TARGET = 6   # команда /matches: показывать матчи, где ударов в створ БОЛЬШЕ этого числа (всего по обеим командам)
+SHOW_TOP = 5
+MAX_STATS_CALLS = 40     # лимит запросов статистики за один вызов /matches
 SCAN_INTERVAL = 90       # пауза между проверками (сек), чтобы не выжигать лимит API
 MAX_SCAN_MINUTES = 180   # через сколько минут непрерывного поиска остановиться само
 TOP_LEAGUE_IDS = {2, 3, 848, 39, 140, 135, 78, 61, 88, 94}
@@ -402,6 +405,68 @@ def stop_search():
         send_telegram_message("Сейчас поиск не запущен.")
 
 
+def show_matches():
+    """/matches — что бот видит прямо сейчас: топ матчей по ударам в створ."""
+    try:
+        send_telegram_message("🔎 Собираю матчи с Фонбета и статистику...")
+        try:
+            fb_all = load_fonbet_live_football()
+        except Exception as e:
+            send_telegram_message(f"❌ Фонбет не отвечает: <code>{html.escape(str(e))[:300]}</code>")
+            return
+        fb_list = [fb for fb in fb_all if fb["minute"] is not None and fb["minute"] <= MAX_MINUTE]
+        if not fb_list:
+            send_telegram_message(f"На Фонбете {len(fb_all)} live-матчей, но с минутой до {MAX_MINUTE} нет.")
+            return
+
+        fixtures = load_apifootball_live()
+        linked = []
+        for fb in fb_list:
+            fx = find_fixture_for_fb(fb, fixtures)
+            if fx:
+                linked.append((fb, fx))
+
+        rows = []
+        for fb, fx in linked[:MAX_STATS_CALLS]:
+            st = get_team_statistics(fx["fid"], fx["home_id"], fx["away_id"])
+            total_ot = st["home"]["on_target"] + st["away"]["on_target"]
+            rows.append({"fb": fb, "st": st, "ot": total_ot})
+
+        shown = [r for r in rows if r["ot"] > SHOW_MIN_ON_TARGET]
+        shown.sort(key=lambda r: r["ot"], reverse=True)
+
+        send_telegram_message(
+            f"📡 Фонбет, live-футбол: <b>{len(fb_all)}</b>\n"
+            f"До {MAX_MINUTE}-й минуты: <b>{len(fb_list)}</b>\n"
+            f"Найдены в API-Football (есть статистика): <b>{len(linked)}</b>\n"
+            f"С ударами в створ &gt; {SHOW_MIN_ON_TARGET}: <b>{len(shown)}</b>")
+
+        if not shown:
+            send_telegram_message(f"Матчей с более чем {SHOW_MIN_ON_TARGET} ударами в створ сейчас нет.")
+            return
+
+        for r in shown[:SHOW_TOP]:
+            fb, st = r["fb"], r["st"]
+            h, a = st["home"], st["away"]
+            home = html.escape(translate_name(fb["home"]))
+            away = html.escape(translate_name(fb["away"]))
+            send_telegram_message(
+                f"⚽️ <b>{home}</b> — <b>{away}</b>\n"
+                f"🏆 {html.escape(fb['league'])}\n"
+                f"⏱ {fb['minute']}' | Счёт: <b>{fb['hg']}:{fb['ag']}</b>\n\n"
+                f"🎯 В створ: <b>{h['on_target']}</b> : <b>{a['on_target']}</b> (всего {r['ot']})\n"
+                f"💥 Всего ударов: {h['shots']} : {a['shots']}\n"
+                f"🥅 Из штрафной: {h['inside_box']} : {a['inside_box']}\n"
+                f"📐 Угловые: {h['corners']} : {a['corners']}")
+        if len(linked) > MAX_STATS_CALLS:
+            send_telegram_message(
+                f"ℹ️ Статистика запрошена только по первым {MAX_STATS_CALLS} матчам из {len(linked)} "
+                "(экономия лимита API).")
+    except Exception as e:
+        print(f"Ошибка /matches: {e}")
+        send_telegram_message("⚠️ Ошибка при сборе матчей.")
+
+
 def debug_fonbet():
     """/debug — проверка связи с Фонбетом."""
     try:
@@ -432,6 +497,8 @@ def telegram_listener():
                 text = msg["text"].strip().lower()
                 if text in ("поиск", "/search", "найти"):
                     start_search()
+                elif text in ("матчи", "/matches"):
+                    threading.Thread(target=show_matches, daemon=True).start()
                 elif text in ("стоп", "/stop", "stop"):
                     stop_search()
                 elif text == "/debug":
@@ -441,6 +508,7 @@ def telegram_listener():
                         "👋 Бот готов!\n\nНапишите <b>поиск</b> — найду live-матчи на Фонбете до "
                         f"{MAX_MINUTE}-й минуты и подскажу, какая команда может забить, "
                         "по live-статистике и предматчевому прогнозу. Бот сам проверяет лайв, пока не найдёт матч.\n"
+                        "<b>матчи</b> — показать топ-5 матчей по ударам в створ.\n"
                         "<b>стоп</b> — остановить поиск.\n"
                         "<b>/debug</b> — проверка связи с Фонбетом.")
         except Exception as e:
