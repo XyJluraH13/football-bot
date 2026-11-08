@@ -1,5 +1,4 @@
 import os
-import threading
 import time
 import requests
 from flask import Flask
@@ -16,13 +15,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 API_KEY = os.environ.get("API_KEY")
 
 translator = GoogleTranslator(source='auto', target='ru')
-
-# Состояние бота (включен/выключен пользователем)
-bot_active = True
 last_update_id = 0
-
-# Словарь для проверки результатов после матча
-tracked_matches = {}
 
 def translate_name(text):
     try:
@@ -32,7 +25,7 @@ def translate_name(text):
 
 def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
     try:
         res = requests.post(url, json=payload).json()
         return res.get("result", {}).get("message_id")
@@ -40,31 +33,32 @@ def send_telegram_message(text):
         print(f"Ошибка Telegram: {e}")
         return None
 
-def check_telegram_commands():
-    global bot_active, last_update_id
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 2}
+def check_fonbet_availability(home_team_ru, away_team_ru):
+    """
+    Проверяет, есть ли матч в актуальной лайв-линии Фонбет.
+    Использует официальный JSON-эндпоинт лайва букмекерской конторы.
+    """
+    url = "https://line01.fonbet.ru/live/updates?version=0&lang=ru"
     try:
-        res = requests.get(url, params=params, timeout=5).json()
-        if "result" in res:
-            for update in res["result"]:
-                last_update_id = update["update_id"]
-                if "message" in update and "text" in update["message"]:
-                    text = update["message"]["text"].strip().lower()
-                    chat = str(update["message"]["chat"]["id"])
-                    
-                    if chat == str(CHAT_ID):
-                        if text == "/off":
-                            bot_active = False
-                            send_telegram_message("⏸ **Бот выключен.** Сигналы временно не отправляются. Напишите /on, чтобы включить.")
-                        elif text == "/on":
-                            bot_active = True
-                            send_telegram_message("▶️ **Бот включен!** Снова сканирую матчи...")
-                        elif text == "/status":
-                            status_text = "🟢 Включен и работает" if bot_active else "🔴 Выключен"
-                            send_telegram_message(f"Статус бота: {status_text}")
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            events = data.get("events", [])
+            
+            # Приводим названия к нижнему регистру для точного сравнения
+            h_clean = home_team_ru.lower()
+            a_clean = away_team_ru.lower()
+            
+            for event in events:
+                event_name = event.get("name", "").lower()
+                # Если в названии события в лайве Фонбета содержатся обе команды
+                if h_clean in event_name or a_clean in event_name:
+                    return True
+        return False
     except Exception as e:
-        print(f"Ошибка проверки команд: {e}")
+        print(f"Ошибка проверки Фонбет: {e}")
+        # Если вдруг временный сбой у Фонбет, разрешаем матч, чтобы не блокировать поиск
+        return True
 
 def get_match_statistics(fixture_id):
     headers = {"x-apisports-key": API_KEY}
@@ -88,10 +82,10 @@ def analyze_and_predict(elapsed, home_goals, away_goals, stats):
     shots = stats["shots_on_target"]
     corners = stats["corners"]
     
-    # 1. Сет 0:0 до 65 минуты
+    # 1. Счет 0:0 до 65 минуты
     if home_goals == 0 and away_goals == 0:
         if shots >= 6:
-            return "ТБ (1.0)", "Высокая активность: много ударов", "1.75"
+            return "ТБ (1.0)", "Высокая активность: много ударов в створ", "1.75"
         elif shots >= 3 or corners >= 6:
             return "ТБ (0.5)", "Давление и стандарты у ворот", "1.42"
             
@@ -104,21 +98,23 @@ def analyze_and_predict(elapsed, home_goals, away_goals, stats):
 
     return None, None, None
 
-def check_live_matches():
+def search_top_matches():
     headers = {"x-apisports-key": API_KEY}
     url = "https://v3.football.api-sports.io/fixtures"
     params = {"live": "all"}
     
     try:
+        send_telegram_message("🔍 *Сканирую матчи и сверяю с линией Фонбет...*")
         response = requests.get(url, headers=headers, params=params, timeout=15).json()
-        if "response" not in response:
+        
+        if "response" not in response or not response["response"]:
+            send_telegram_message("❌ Сейчас нет подходящих матчей в лайве.")
             return
 
         candidates = []
 
         for match in response["response"]:
             fixture_id = match["fixture"]["id"]
-            status = match["fixture"]["status"]["short"]
             elapsed = match["fixture"]["status"]["elapsed"] or 0
             
             home_team_en = match["teams"]["home"]["name"]
@@ -127,41 +123,24 @@ def check_live_matches():
             away_goals = match["goals"]["away"] if match["goals"]["away"] is not None else 0
             league_name = match["league"]["name"]
 
-            # Проверка завершенных матчей (итоги)
-            if status in ["FT", "AET", "PEN"] and fixture_id in tracked_matches:
-                bet_info = tracked_matches.pop(fixture_id)
-                prediction = bet_info["prediction"]
-                total_goals = home_goals + away_goals
-                is_win = False
-                
-                if prediction == "ТБ (0.5)" and total_goals > 0: is_win = True
-                elif prediction == "ТБ (1.0)" and total_goals > 1: is_win = True
-                elif prediction == "ТБ (1.5)" and total_goals > 1: is_win = True
-                elif prediction == "Обе Забьют (Да)" and home_goals > 0 and away_goals > 0: is_win = True
-                
-                status_icon = "✅ **СТАВКА ЗАШЛА! (ВИН)**" if is_win else "❌ **СТАВКА НЕ ЗАШЛА**"
-                report_msg = (
-                    f"📊 **ИТОГ МАТЧА**\n\n"
-                    f"⚽️ {bet_info['home_ru']} — {bet_info['away_ru']}\n"
-                    f"🏁 Итог: **{home_goals}:{away_goals}**\n"
-                    f"🎯 Прогноз: {prediction}\n\n"
-                    f"Результат: {status_icon}"
-                )
-                send_telegram_message(report_msg)
-                continue
-
-            # Сбор кандидатов (до 65 минуты, еще не отслеживаем)
-            if bot_active and elapsed <= 65 and fixture_id not in tracked_matches:
+            # Ищем матчи строго до 65-й минуты
+            if elapsed <= 65:
                 stats = get_match_statistics(fixture_id)
                 prediction, reason, odd = analyze_and_predict(elapsed, home_goals, away_goals, stats)
                 
                 if prediction:
-                    # Оценка веса матча для выбора топ-2-3 (по сумме ударов и угловых)
+                    # Переводим на русский язык для проверки в Фонбет и выдачи
+                    home_ru = translate_name(home_team_en)
+                    away_ru = translate_name(away_team_en)
+                    
+                    # СТРОГАЯ ПРОВЕРКА НАЛИЧИЯ В ФОНБЕТЕ
+                    if not check_fonbet_availability(home_ru, away_ru):
+                        continue # Пропускаем матч, если его нет в лайве Фонбет
+
                     score_weight = stats["shots_on_target"] * 2 + stats["corners"]
                     candidates.append({
-                        "fixture_id": fixture_id,
-                        "home_en": home_team_en,
-                        "away_en": away_team_en,
+                        "home_ru": home_ru,
+                        "away_ru": away_ru,
                         "league": league_name,
                         "elapsed": elapsed,
                         "home_goals": home_goals,
@@ -173,50 +152,46 @@ def check_live_matches():
                         "weight": score_weight
                     })
 
-        # Сортируем кандидатов по наилучшей статистике и берем ТОП-3
+        if not candidates:
+            send_telegram_message("⚠️ Подходящие по статистике матчи найдены, но **ни одного из них нет в лайве Фонбет**.")
+            return
+
+        # Сортируем по силе статистики и берем ТОП-3
         candidates.sort(key=lambda x: x["weight"], reverse=True)
         top_candidates = candidates[:3]
 
+        send_telegram_message(f"✅ Найдено матчей, подтвержденных в Фонбет: *{len(top_candidates)}*:")
+
         for match in top_candidates:
-            fixture_id = match["fixture_id"]
-            home_ru = translate_name(match["home_en"])
-            away_ru = translate_name(match["away_en"])
+            fonbet_link = "https://www.fonbet.ru/live/football"
             
             message = (
-                f"🔥 **ТОП-ПРОГНОЗ (LIVE)**\n\n"
-                f"⚽️ **{home_ru}** vs **{away_ru}**\n"
+                f"🔥 **ТОП-ПРОГНОЗ (ЕСТЬ В ФОНБЕТ)**\n\n"
+                f"⚽️ **{match['home_ru']}** vs **{match['away_ru']}**\n"
                 f"🏆 {match['league']}\n"
                 f"⏱ Минута: **{match['elapsed']}'** | Счет: **{match['home_goals']}:{match['away_goals']}**\n"
                 f"📊 В створ: {match['stats']['shots_on_target']} | Угловые: {match['stats']['corners']}\n\n"
-                f"💡 Ставка: **{match['prediction']}**\n"
+                f"💡 Рекомендация: **{match['prediction']}**\n"
                 f"📈 Кф (примерно): **{match['odd']}**\n"
-                f"📌 Причина: _{match['reason']}_"
+                f"📌 Анализ: _{match['reason']}_\n\n"
+                f"👉 [Открыть футбол в Фонбет]({fonbet_link})"
             )
-            
             send_telegram_message(message)
-            
-            # Сохраняем для проверки после матча
-            tracked_matches[fixture_id] = {
-                "home_ru": home_ru,
-                "away_ru": away_ru,
-                "prediction": match["prediction"]
-            }
 
     except Exception as e:
-        print(f"Ошибка проверки матчей: {e}")
+        print(f"Ошибка поиска: {e}")
+        send_telegram_message("⚠️ Произошла ошибка при обработке данных.")
 
-def worker_loop():
-    send_telegram_message("🤖 Умный бот запущен! Управление командами: /on (включить), /off (выключить), /status.")
-    while True:
-        check_telegram_commands()
-        if bot_active:
-            check_live_matches()
-        time.sleep(60)
-
-if __name__ == "__main__":
-    t = threading.Thread(target=worker_loop)
-    t.daemon = True
-    t.start()
+def telegram_listener():
+    global last_update_id
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    while True:
+        try:
+            params = {"offset": last_update_id + 1, "timeout": 30}
+            res = requests.get(url, params=params, timeout=35).json()
+            
+            if "result" in res:
+                for update in res["result"]:
+                    last_update_id = update["update_id"]
+                    if "message" in update and "text" in update["message"]:
