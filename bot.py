@@ -176,9 +176,18 @@ def load_fonbet_live_football():
         misc = miscs.get(ev["id"], {})
         if not has_place and not (misc.get("timerSeconds") or 0) > 0:
             continue   # нет признаков, что матч идёт
-        minute = None
+        minute, raw_min, age = None, None, None
         if misc.get("timerSeconds") is not None:
-            minute = int(misc["timerSeconds"] // 60)
+            raw_min = int(misc["timerSeconds"] // 60)
+            secs = float(misc["timerSeconds"])
+            # Фонбет отдаёт значение таймера на момент timerUpdateTimestamp — дорабатываем до "сейчас"
+            ts = misc.get("timerUpdateTimestamp")
+            if isinstance(ts, (int, float)) and ts > 0:
+                ts = ts / 1000.0 if ts > 1e12 else ts
+                age = now - ts
+                if misc.get("timerDirection") == 1 and 0 <= age <= 3 * 3600:
+                    secs += age
+            minute = int(secs // 60)
         if "sample" not in fonbet_info:
             fonbet_info["sample"] = {"place": ev.get("place"), "startTime": ev.get("startTime"),
                                       "level": ev.get("level"), "timerSeconds": misc.get("timerSeconds")}
@@ -186,6 +195,10 @@ def load_fonbet_live_football():
             "id": ev["id"], "home": ev["team1"], "away": ev["team2"], "league": league,
             "hg": int(misc.get("team1Score", 0) or 0), "ag": int(misc.get("team2Score", 0) or 0),
             "minute": minute,
+            "raw": {"timerSeconds": misc.get("timerSeconds"), "dir": misc.get("timerDirection"),
+                    "upd_age_s": None if age is None else int(age), "raw_min": raw_min,
+                    "since_start_min": int((now - st_time) // 60) if isinstance(st_time, (int, float)) else None,
+                    "misc_keys": sorted(misc.keys())[:14]},
         })
     return result
 
@@ -581,6 +594,16 @@ def debug_fonbet():
         f"Всего событий в линии: {fonbet_info.get('total_events')}\n"
         f"Поле place: <code>{html.escape(str(fonbet_info.get('place_counts')))}</code>\n"
         f"Пример live-события: <code>{html.escape(str(fonbet_info.get('sample')))}</code>")
+    rows = []
+    for x in fb_list[:6]:
+        r = x["raw"]
+        rows.append(f"{x['home']} — {x['away']} | счёт {x['hg']}:{x['ag']}\n"
+                    f"  минута (расчёт)={x['minute']}, timerSeconds={r['timerSeconds']} (={r['raw_min']} мин), "
+                    f"dir={r['dir']}, возраст таймера={r['upd_age_s']} c, с момента старта={r['since_start_min']} мин")
+    if rows:
+        send_telegram_message("🧪 <b>Сырые данные таймера (первые матчи):</b>\n<code>"
+                              + html.escape("\n".join(rows)) + "</code>\n\n"
+                              + "Ключи misc: <code>" + html.escape(str(fb_list[0]["raw"]["misc_keys"])) + "</code>")
 
 
 def telegram_listener():
