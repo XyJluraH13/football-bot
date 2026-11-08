@@ -117,6 +117,9 @@ def name_sim(a, b):
     return r
 
 
+fonbet_info = {}
+
+
 def load_fonbet_live_football():
     """Возвращает список live-футбольных матчей Фонбета:
     [{id, home, away, league, hg, ag, minute}]
@@ -137,11 +140,24 @@ def load_fonbet_live_football():
         return sports.get(sid)
 
     miscs = {m["id"]: m for m in data.get("eventMiscs", [])}
+    events = data.get("events", [])
+    has_place = any("place" in e for e in events)   # есть ли в данных пометка live/line
+    now = time.time()
+    place_counts = {}
+    for e in events:
+        key = str(e.get("place"))
+        place_counts[key] = place_counts.get(key, 0) + 1
+    fonbet_info["total_events"] = len(events)
+    fonbet_info["place_counts"] = place_counts
     result = []
-    for ev in data.get("events", []):
+    for ev in events:
         if ev.get("level") not in (1, None):
             continue
-        if ev.get("place") not in ("live", None):
+        # только реально идущие матчи: не prematch-линия и не "ещё не начался"
+        if has_place and ev.get("place") != "live":
+            continue
+        st_time = ev.get("startTime")
+        if isinstance(st_time, (int, float)) and st_time > now + 60:
             continue
         if not ev.get("team1") or not ev.get("team2"):
             continue
@@ -158,11 +174,14 @@ def load_fonbet_live_football():
         if "(" in ev["team1"] or "(" in ev["team2"]:   # кибер-матчи с никами игроков
             continue
         misc = miscs.get(ev["id"], {})
-        if not misc and ev.get("place") is None:
-            continue
+        if not has_place and not (misc.get("timerSeconds") or 0) > 0:
+            continue   # нет признаков, что матч идёт
         minute = None
         if misc.get("timerSeconds") is not None:
             minute = int(misc["timerSeconds"] // 60)
+        if "sample" not in fonbet_info:
+            fonbet_info["sample"] = {"place": ev.get("place"), "startTime": ev.get("startTime"),
+                                      "level": ev.get("level"), "timerSeconds": misc.get("timerSeconds")}
         result.append({
             "id": ev["id"], "home": ev["team1"], "away": ev["team2"], "league": league,
             "hg": int(misc.get("team1Score", 0) or 0), "ag": int(misc.get("team2Score", 0) or 0),
@@ -464,7 +483,7 @@ def show_matches():
         except Exception as e:
             send_telegram_message(f"❌ Фонбет не отвечает: <code>{html.escape(str(e))[:300]}</code>")
             return
-        fb_list = [fb for fb in fb_all if fb["minute"] is not None and fb["minute"] <= MAX_MINUTE]
+        fb_list = [fb for fb in fb_all if fb["minute"] is not None and 1 <= fb["minute"] <= MAX_MINUTE]
         if not fb_list:
             send_telegram_message(f"На Фонбете {len(fb_all)} live-матчей, но с минутой до {MAX_MINUTE} нет.")
             return
@@ -555,10 +574,13 @@ def debug_fonbet():
     except Exception as e:
         send_telegram_message(f"❌ Фонбет не отвечает: <code>{html.escape(str(e))[:300]}</code>")
         return
-    ok = [x for x in fb_list if x["minute"] is not None and x["minute"] <= MAX_MINUTE]
+    ok = [x for x in fb_list if x["minute"] is not None and 1 <= x["minute"] <= MAX_MINUTE]
     send_telegram_message(
         f"📡 Live-футбола на Фонбете: <b>{len(fb_list)}</b>\n"
-        f"Из них с минутой до {MAX_MINUTE}: <b>{len(ok)}</b>")
+        f"Из них с минутой 1–{MAX_MINUTE}: <b>{len(ok)}</b>\n\n"
+        f"Всего событий в линии: {fonbet_info.get('total_events')}\n"
+        f"Поле place: <code>{html.escape(str(fonbet_info.get('place_counts')))}</code>\n"
+        f"Пример live-события: <code>{html.escape(str(fonbet_info.get('sample')))}</code>")
 
 
 def telegram_listener():
