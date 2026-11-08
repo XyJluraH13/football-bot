@@ -17,6 +17,20 @@ API_KEY = os.environ.get("API_KEY")
 translator = GoogleTranslator(source='auto', target='ru')
 last_update_id = 0
 
+# Список ID главных топ-лиг мира в API-Football (получают наивысший приоритет)
+TOP_LEAGUE_IDS = [
+    2,    # UEFA Champions League
+    3,    # UEFA Europa League
+    848,  # UEFA Conference League
+    39,   # Premier League (Англия)
+    140,  # La Liga (Испания)
+    135,  # Serie A (Италия)
+    78,   # Bundesliga (Германия)
+    61,   # Ligue 1 (Франция)
+    88,   # Eredivisie (Нидерланды)
+    94,   # Primeira Liga (Португалия)
+]
+
 def translate_name(text):
     try:
         return translator.translate(text)
@@ -32,24 +46,6 @@ def send_telegram_message(text):
     except Exception as e:
         print(f"Ошибка Telegram: {e}")
         return None
-
-def check_fonbet_availability(home_team_ru, away_team_ru):
-    url = "https://line01.fonbet.ru/live/updates?version=0&lang=ru"
-    try:
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            events = data.get("events", [])
-            h_clean = home_team_ru.lower()
-            a_clean = away_team_ru.lower()
-            for event in events:
-                event_name = event.get("name", "").lower()
-                if h_clean in event_name or a_clean in event_name:
-                    return True
-        return False
-    except Exception as e:
-        print(f"Ошибка проверки Фонбет: {e}")
-        return True
 
 def get_match_statistics(fixture_id):
     headers = {"x-apisports-key": API_KEY}
@@ -93,7 +89,7 @@ def search_top_matches():
     params = {"live": "all"}
     
     try:
-        send_telegram_message("🔍 *Сканирую матчи и сверяю с линией Фонбет...*")
+        send_telegram_message("🔍 *Сканирую лайв-матчи (приоритет — топ-лиги)...*")
         response = requests.get(url, headers=headers, params=params, timeout=15).json()
         
         if "response" not in response or not response["response"]:
@@ -105,6 +101,7 @@ def search_top_matches():
         for match in response["response"]:
             fixture_id = match["fixture"]["id"]
             elapsed = match["fixture"]["status"]["elapsed"] or 0
+            league_id = match["league"]["id"]
             
             home_team_en = match["teams"]["home"]["name"]
             away_team_en = match["teams"]["away"]["name"]
@@ -119,11 +116,14 @@ def search_top_matches():
                 if prediction:
                     home_ru = translate_name(home_team_en)
                     away_ru = translate_name(away_team_en)
-                    
-                    if not check_fonbet_availability(home_ru, away_ru):
-                        continue
 
+                    # Базовый вес по статистике (удары и угловые)
                     score_weight = stats["shots_on_target"] * 2 + stats["corners"]
+                    
+                    # ПРИОРИТЕТ ТОП-ЛИГ: добавляем крупный бонус к весу для топ-турниров
+                    if league_id in TOP_LEAGUE_IDS:
+                        score_weight += 50
+
                     candidates.append({
                         "home_ru": home_ru,
                         "away_ru": away_ru,
@@ -139,18 +139,19 @@ def search_top_matches():
                     })
 
         if not candidates:
-            send_telegram_message("⚠️ Подходящие по статистике матчи найдены, но ни одного из них нет в лайве Фонбет.")
+            send_telegram_message("⚠️ Матчи идут, но ни один пока не подошел под критерии отбора.")
             return
 
+        # Сортируем по весу (топ-лиги окажутся на самом верху) и берем ТОП-3
         candidates.sort(key=lambda x: x["weight"], reverse=True)
         top_candidates = candidates[:3]
 
-        send_telegram_message(f"✅ Найдено матчей, подтвержденных в Фонбет: *{len(top_candidates)}*:")
+        send_telegram_message(f"✅ Найдено качественных событий (акцент на топ-лиги): *{len(top_candidates)}*:")
 
         for match in top_candidates:
             fonbet_link = "https://www.fonbet.ru/live/football"
             message = (
-                f"🔥 **ТОП-ПРОГНОЗ (ЕСТЬ В ФОНБЕТ)**\n\n"
+                f"🔥 **ТОП-ПРОГНОЗ (LIVE)**\n\n"
                 f"⚽️ **{match['home_ru']}** vs **{match['away_ru']}**\n"
                 f"🏆 {match['league']}\n"
                 f"⏱ Минута: **{match['elapsed']}'** | Счет: **{match['home_goals']}:{match['away_goals']}**\n"
@@ -188,7 +189,7 @@ def telegram_listener():
                             elif text in ["/start", "старт"]:
                                 send_telegram_message(
                                     "👋 Бот готов!\n\n"
-                                    "Напишите слово **поиск**, и бот проверит лайв, отсеет всё лишнее, сверит матчи с линией Фонбет и выдаст лучшие варианты со ссылкой."
+                                    "Напишите слово **поиск**, и бот проверит лайв, отдаст приоритет топ-лигам, проанализирует статистику и выдаст лучшие варианты со ссылкой на Фонбет."
                                 )
         except Exception as e:
             print(f"Ошибка прослушки Telegram: {e}")
