@@ -177,27 +177,47 @@ def load_fonbet_live_football():
         if not has_place and not (misc.get("timerSeconds") or 0) > 0:
             continue   # нет признаков, что матч идёт
         minute, raw_min, age = None, None, None
-        if misc.get("timerSeconds") is not None:
-            raw_min = int(misc["timerSeconds"] // 60)
-            secs = float(misc["timerSeconds"])
-            # Фонбет отдаёт значение таймера на момент timerUpdateTimestamp — дорабатываем до "сейчас"
-            ts = misc.get("timerUpdateTimestamp")
+        paused, estimated = False, False
+        t_secs = misc.get("timerSeconds")
+        since_start = (now - st_time) / 60.0 if isinstance(st_time, (int, float)) else None
+        if t_secs:
+            raw_min = int(t_secs // 60)
+            secs = float(t_secs)
+            ts = misc.get("timerUpdateTimestampMsec") or misc.get("timerUpdateTimestamp")
             if isinstance(ts, (int, float)) and ts > 0:
-                ts = ts / 1000.0 if ts > 1e12 else ts
+                ts = ts / 1000.0 if ts > 1e11 else ts
                 age = now - ts
-                if misc.get("timerDirection") == 1 and 0 <= age <= 3 * 3600:
+            if misc.get("timerDirection") == 1:
+                # таймер идёт: добавляем время с момента его обновления
+                if age is not None and 0 <= age <= 3 * 3600:
                     secs += age
+            else:
+                paused = True            # таймер стоит (перерыв / пауза)
             minute = int(secs // 60)
+        elif since_start is not None and since_start > 0:
+            # таймера в данных нет — оцениваем минуту по времени старта (с учётом перерыва ~15 мин)
+            estimated = True
+            if since_start <= 47:
+                minute = int(since_start)
+            elif since_start <= 62:
+                minute, paused = 45, True
+            else:
+                minute = int(min(since_start - 15, 120))
         if "sample" not in fonbet_info:
             fonbet_info["sample"] = {"place": ev.get("place"), "startTime": ev.get("startTime"),
-                                      "level": ev.get("level"), "timerSeconds": misc.get("timerSeconds")}
+                                      "level": ev.get("level"), "timerSeconds": t_secs}
+        hg = misc.get("score1", misc.get("team1Score", 0)) or 0
+        ag = misc.get("score2", misc.get("team2Score", 0)) or 0
+        try:
+            hg, ag = int(hg), int(ag)
+        except (TypeError, ValueError):
+            hg, ag = 0, 0
         result.append({
             "id": ev["id"], "home": ev["team1"], "away": ev["team2"], "league": league,
-            "hg": int(misc.get("team1Score", 0) or 0), "ag": int(misc.get("team2Score", 0) or 0),
-            "minute": minute,
-            "raw": {"timerSeconds": misc.get("timerSeconds"), "dir": misc.get("timerDirection"),
+            "hg": hg, "ag": ag, "minute": minute, "paused": paused, "estimated": estimated,
+            "raw": {"timerSeconds": t_secs, "dir": misc.get("timerDirection"),
                     "upd_age_s": None if age is None else int(age), "raw_min": raw_min,
-                    "since_start_min": int((now - st_time) // 60) if isinstance(st_time, (int, float)) else None,
+                    "since_start_min": None if since_start is None else int(since_start),
                     "misc_keys": sorted(misc.keys())[:14]},
         })
     return result
@@ -324,10 +344,15 @@ def live_index(st):
 # ---------------------------------------------------------------- поиск
 def load_apifootball_live():
     """Live-матчи API-Football (нужны для статистики и предматчевых прогнозов)."""
+    global last_api_error
     try:
         res = requests.get(f"{API_HOST}/fixtures", headers=HEADERS,
                            params={"live": "all"}, timeout=20).json()
+        if res.get("errors"):
+            last_api_error = str(res["errors"])[:200]
+            print(f"API-Football errors: {res['errors']}")
     except Exception as e:
+        last_api_error = str(e)[:200]
         print(f"API-Football недоступен: {e}")
         return []
     out = []
@@ -350,7 +375,7 @@ def find_signals():
         print(f"Фонбет недоступен: {e}")
         return [], "fonbet"
     fb_list = [fb for fb in fb_list
-               if fb["minute"] is not None and 10 <= fb["minute"] <= MAX_MINUTE]
+               if fb["minute"] is not None and 10 <= fb["minute"] <= MAX_MINUTE and not fb["paused"]]
     if not fb_list:
         return [], None
 
@@ -473,6 +498,11 @@ def stop_search():
         send_telegram_message("Сейчас поиск не запущен.")
 
 
+def fmt_min(fb):
+    mark = "~" if fb.get("estimated") else ""
+    return f"{mark}{fb['minute']}'" + (" (перерыв)" if fb.get("paused") else "")
+
+
 def send_chunks(blocks, sep="\n\n"):
     """Склеивает блоки в сообщения не длиннее лимита Telegram."""
     cur = ""
@@ -502,6 +532,12 @@ def show_matches():
             return
 
         fixtures = load_apifootball_live()
+        if not fixtures:
+            send_telegram_message(
+                "❌ API-Football не вернул ни одного live-матча — сопоставлять не с чем.\n"
+                + (f"Ответ API: <code>{html.escape(last_api_error)}</code>" if last_api_error
+                   else "Ошибок API нет, список просто пуст (проверьте ключ API_KEY и тариф)."))
+            return
         linked, unlinked = [], []
         for fb in fb_list:
             fx = find_fixture_for_fb(fb, fixtures)
@@ -531,7 +567,7 @@ def show_matches():
             send_telegram_message(
                 f"⚽️ <b>{home}</b> — <b>{away}</b>\n"
                 f"🏆 {html.escape(fb['league'])}\n"
-                f"⏱ Фонбет: {fb['minute']}' {fb['hg']}:{fb['ag']} | "
+                f"⏱ Фонбет: {fmt_min(fb)} {fb['hg']}:{fb['ag']} | "
                 f"API: {fx['elapsed']}' {fx['hg']}:{fx['ag']}\n"
                 f"🔗 API-Football: {html.escape(fx['home'])} — {html.escape(fx['away'])}\n\n"
                 f"🎯 В створ: <b>{h['on_target']}</b> : <b>{a['on_target']}</b>\n"
@@ -545,7 +581,7 @@ def show_matches():
         # Сопоставлены, но статистики нет
         if no_stats:
             blocks = [f"• {html.escape(r['fb']['home'])} — {html.escape(r['fb']['away'])} "
-                      f"({r['fb']['minute']}')" for r in no_stats]
+                      f"({fmt_min(r['fb'])})" for r in no_stats]
             send_chunks(["🚫 <b>Сопоставлены, но API не вернул статистику:</b>\n" + "\n".join(blocks)])
 
         # Не нашли пару в API-Football — показываем почему
@@ -554,7 +590,7 @@ def show_matches():
             for fb, _ in unlinked[:MAX_UNLINKED_SHOWN]:
                 cand, sc = best_candidate(fb, fixtures)
                 head = (f"• {html.escape(fb['home'])} — {html.escape(fb['away'])} "
-                        f"({fb['minute']}', {fb['hg']}:{fb['ag']})")
+                        f"({fmt_min(fb)}, {fb['hg']}:{fb['ag']})")
                 if cand and sc >= 0.5:
                     why = []
                     if (cand["hg"], cand["ag"]) != (fb["hg"], fb["ag"]):
@@ -598,7 +634,7 @@ def debug_fonbet():
     for x in fb_list[:6]:
         r = x["raw"]
         rows.append(f"{x['home']} — {x['away']} | счёт {x['hg']}:{x['ag']}\n"
-                    f"  минута (расчёт)={x['minute']}, timerSeconds={r['timerSeconds']} (={r['raw_min']} мин), "
+                    f"  минута (расчёт)={x['minute']}{' ~оценка' if x['estimated'] else ''}{' пауза' if x['paused'] else ''}, timerSeconds={r['timerSeconds']} (={r['raw_min']} мин), "
                     f"dir={r['dir']}, возраст таймера={r['upd_age_s']} c, с момента старта={r['since_start_min']} мин")
     if rows:
         send_telegram_message("🧪 <b>Сырые данные таймера (первые матчи):</b>\n<code>"
