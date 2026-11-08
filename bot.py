@@ -1,5 +1,3 @@
-11.08 18:56
-bot.py
 import os
 import threading
 import time
