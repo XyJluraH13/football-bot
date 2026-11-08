@@ -23,8 +23,8 @@ API_KEY = os.environ.get("API_KEY")
 
 # ====== НАСТРОЙКИ ======
 MAX_MINUTE = 65          # не позже 65-й минуты
-MIN_ODD = 1.20           # коэффициент не ниже 1.2
-MIN_PRESSURE = 6.0       # минимальный индекс голевых моментов
+MIN_TEAM_PRESSURE = 4.0  # минимальный live-индекс моментов у команды, которая может забить
+PREMATCH_WEIGHT = 0.08   # вклад предматчевого прогноза (0..100% -> 0..8 баллов)
 MAX_RESULTS = 3
 TOP_LEAGUE_IDS = {2, 3, 848, 39, 140, 135, 78, 61, 88, 94}
 
@@ -32,11 +32,6 @@ TOP_LEAGUE_IDS = {2, 3, 848, 39, 140, 135, 78, 61, 88, 94}
 FONBET_BASE_URL = os.environ.get("FONBET_BASE_URL", "https://line-lb51.bk6bba-resources.com")
 FONBET_LANG = os.environ.get("FONBET_LANG", "en")
 FONBET_SCOPE = os.environ.get("FONBET_SCOPE", "1600")
-# id факторов "Тотал больше" в линии Фонбета. Если кф не находятся — запустите /debug
-FONBET_OVER_IDS = {int(x) for x in os.environ.get("FONBET_OVER_IDS", "930,1696").split(",")}
-# Матчи и кф берутся ТОЛЬКО с Фонбета. API-Football нужен лишь для статистики ударов/угловых
-# (на Фонбете её нет). Если статистику найти не удалось — показывать матч без неё?
-ALLOW_WITHOUT_STATS = False
 NAME_MATCH_MIN = 0.72    # порог похожести названий команд (0..1)
 MINUTE_TOLERANCE = 6     # допуск по минуте при сопоставлении матча
 # =======================
@@ -117,31 +112,9 @@ def name_sim(a, b):
     return r
 
 
-def parse_line(f):
-    """Достаёт линию тотала (x.5) из фактора Фонбета."""
-    pt = f.get("pt")
-    if pt:
-        m = re.search(r"\d+(?:[.,]\d+)?", str(pt))
-        if m:
-            x = float(m.group().replace(",", "."))
-            if (x * 2) % 2 == 1:
-                return x
-    p = f.get("p")
-    if p is not None:
-        try:
-            x = float(p)
-        except (TypeError, ValueError):
-            return None
-        if x > 20:
-            x /= 100.0
-        if (x * 2) % 2 == 1:
-            return x
-    return None
-
-
 def load_fonbet_live_football():
     """Возвращает список live-футбольных матчей Фонбета:
-    [{id, home, away, league, hg, ag, minute, totals:{линия: кф_больше}}]
+    [{id, home, away, league, hg, ag, minute}]
     Бросает исключение, если Фонбет недоступен."""
     url = f"{FONBET_BASE_URL}/events/listBase"
     params = {"lang": FONBET_LANG, "scopeMarket": FONBET_SCOPE}
@@ -159,10 +132,6 @@ def load_fonbet_live_football():
         return sports.get(sid)
 
     miscs = {m["id"]: m for m in data.get("eventMiscs", [])}
-    factors = {}
-    for cf in data.get("customFactors", []):
-        factors[cf.get("e")] = cf.get("factors", [])
-
     result = []
     for ev in data.get("events", []):
         if ev.get("level") not in (1, None):
@@ -189,18 +158,12 @@ def load_fonbet_live_football():
         minute = None
         if misc.get("timerSeconds") is not None:
             minute = int(misc["timerSeconds"] // 60)
-        totals = {}
-        for f in factors.get(ev["id"], []):
-            if f.get("f") in FONBET_OVER_IDS and not f.get("b") and f.get("v"):
-                line = parse_line(f)
-                if line is not None:
-                    totals[line] = float(f["v"])
         result.append({
             "id": ev["id"], "home": ev["team1"], "away": ev["team2"], "league": league,
             "hg": int(misc.get("team1Score", 0) or 0), "ag": int(misc.get("team2Score", 0) or 0),
-            "minute": minute, "totals": totals,
+            "minute": minute,
         })
-    return result, factors
+    return result
 
 
 def find_fixture_for_fb(fb, fixtures):
@@ -222,41 +185,72 @@ def find_fixture_for_fb(fb, fixtures):
 
 
 # ---------------------------------------------------------------- API-Football
-def get_match_statistics(fixture_id):
-    stats = {"on_target": 0, "shots": 0, "inside_box": 0, "corners": 0}
+def get_team_statistics(fixture_id, home_id, away_id):
+    """Live-статистика отдельно по каждой команде."""
+    empty = lambda: {"on_target": 0, "shots": 0, "inside_box": 0, "corners": 0}
+    out = {"home": empty(), "away": empty()}
     try:
         res = requests.get(f"{API_HOST}/fixtures/statistics", headers=HEADERS,
                            params={"fixture": fixture_id}, timeout=10).json()
         for team_stat in res.get("response", []):
+            tid = team_stat.get("team", {}).get("id")
+            side = "home" if tid == home_id else "away" if tid == away_id else None
+            if not side:
+                continue
             for item in team_stat.get("statistics", []):
                 t, val = item.get("type"), item.get("value")
                 if not val:
                     continue
                 if t == "Shots on Goal":
-                    stats["on_target"] += to_int(val)
+                    out[side]["on_target"] += to_int(val)
                 elif t == "Total Shots":
-                    stats["shots"] += to_int(val)
+                    out[side]["shots"] += to_int(val)
                 elif t == "Shots insidebox":
-                    stats["inside_box"] += to_int(val)
+                    out[side]["inside_box"] += to_int(val)
                 elif t == "Corner Kicks":
-                    stats["corners"] += to_int(val)
+                    out[side]["corners"] += to_int(val)
     except Exception as e:
         print(f"Ошибка статистики {fixture_id}: {e}")
-    return stats
+    return out
 
 
-def pressure_score(elapsed, stats):
-    base = (stats["on_target"] * 2.0
-            + stats["inside_box"] * 1.0
-            + (stats["shots"] - stats["on_target"]) * 0.4
-            + stats["corners"] * 0.6)
-    pace = base / max(elapsed, 1) * 10
-    return base, pace
+_prematch_cache = {}
+
+
+def get_prematch(fixture_id):
+    """Предматчевый прогноз API-Football: шансы на победу, сравнение атаки и формы.
+    Возвращает {'home': 0..100, 'away': 0..100, 'win': {...}} или None."""
+    if fixture_id in _prematch_cache:
+        return _prematch_cache[fixture_id]
+    result = None
+    try:
+        res = requests.get(f"{API_HOST}/predictions", headers=HEADERS,
+                           params={"fixture": fixture_id}, timeout=10).json()
+        r = (res.get("response") or [None])[0]
+        if r:
+            pct = r.get("predictions", {}).get("percent", {})
+            comp = r.get("comparison", {})
+            result = {"win": {"home": to_int(pct.get("home")), "away": to_int(pct.get("away"))}}
+            for side in ("home", "away"):
+                parts = [to_int(pct.get(side)),
+                         to_int(comp.get("att", {}).get(side)),
+                         to_int(comp.get("form", {}).get(side))]
+                parts = [p for p in parts if p > 0]
+                result[side] = sum(parts) / len(parts) if parts else 0
+    except Exception as e:
+        print(f"Ошибка прогноза {fixture_id}: {e}")
+    _prematch_cache[fixture_id] = result
+    return result
+
+
+def live_index(st):
+    return (st["on_target"] * 2.0 + st["inside_box"] * 1.0
+            + max(st["shots"] - st["on_target"], 0) * 0.4 + st["corners"] * 0.6)
 
 
 # ---------------------------------------------------------------- поиск
 def load_apifootball_live():
-    """Один запрос: live-матчи API-Football (нужны только для привязки статистики)."""
+    """Live-матчи API-Football (нужны для статистики и предматчевых прогнозов)."""
     try:
         res = requests.get(f"{API_HOST}/fixtures", headers=HEADERS,
                            params={"live": "all"}, timeout=20).json()
@@ -269,64 +263,55 @@ def load_apifootball_live():
             "fid": m["fixture"]["id"], "elapsed": m["fixture"]["status"]["elapsed"] or 0,
             "hg": m["goals"]["home"] or 0, "ag": m["goals"]["away"] or 0,
             "home": m["teams"]["home"]["name"], "away": m["teams"]["away"]["name"],
-            "league_id": m["league"]["id"], "league": m["league"]["name"],
+            "home_id": m["teams"]["home"]["id"], "away_id": m["teams"]["away"]["id"],
+            "league_id": m["league"]["id"],
         })
     return out
 
 
 def search_top_matches():
     try:
-        send_telegram_message("🔎 <b>Ищу матчи в лайве Фонбета...</b>")
+        send_telegram_message("🔎 <b>Ищу матчи на Фонбете и анализирую моменты...</b>")
 
-        # 1) Матчи и кф — только Фонбет
+        # 1) Матчи — только Фонбет
         try:
-            fb_list, _ = load_fonbet_live_football()
+            fb_list = load_fonbet_live_football()
         except Exception as e:
             print(f"Фонбет недоступен: {e}")
             send_telegram_message("❌ Не удалось загрузить линию Фонбета. Проверьте /debug.")
             return
+        fb_list = [fb for fb in fb_list
+                   if fb["minute"] is not None and 10 <= fb["minute"] <= MAX_MINUTE]
         if not fb_list:
-            send_telegram_message("❌ На Фонбете сейчас нет live-футбола.")
+            send_telegram_message(f"❌ На Фонбете нет live-матчей с минутой до {MAX_MINUTE}.")
             return
 
-        pre = []
-        for fb in fb_list:
-            if fb["minute"] is None or fb["minute"] < 10 or fb["minute"] > MAX_MINUTE:
-                continue
-            line = fb["hg"] + fb["ag"] + 0.5      # 0:0 -> ТБ 0.5, 1:0 -> ТБ 1.5 ...
-            odd = fb["totals"].get(line)
-            if odd is None or odd < MIN_ODD:
-                continue
-            pre.append({"fb": fb, "line": line, "odd": odd})
-
-        if not pre:
-            send_telegram_message(
-                f"⚠️ На Фонбете нет матчей с минутой ≤ {MAX_MINUTE} и кф на ТБ ≥ {MIN_ODD}.")
-            return
-
-        # 2) Статистика моментов — из API-Football (на Фонбете её нет)
+        # 2) Статистика и прогнозы — API-Football
         fixtures = load_apifootball_live()
         candidates = []
-        for p in pre:
-            fb = p["fb"]
+        for fb in fb_list:
             fx = find_fixture_for_fb(fb, fixtures)
-            if fx:
-                stats = get_match_statistics(fx["fid"])
-                base, pace = pressure_score(fb["minute"], stats)
-                if base < MIN_PRESSURE:
-                    continue
-                weight = base + pace * 2 + (30 if fx["league_id"] in TOP_LEAGUE_IDS else 0)
-            else:
-                if not ALLOW_WITHOUT_STATS:
-                    continue
-                stats, weight = None, 0
-            candidates.append({**p, "stats": stats, "weight": weight,
-                               "fid": fb["id"], "total": fb["hg"] + fb["ag"]})
+            if not fx:
+                continue
+            st = get_team_statistics(fx["fid"], fx["home_id"], fx["away_id"])
+            pre = get_prematch(fx["fid"])
+            scores = {}
+            for side in ("home", "away"):
+                live = live_index(st[side])
+                prem = pre[side] if pre else 0
+                scores[side] = (live, live + prem * PREMATCH_WEIGHT)
+            side = "home" if scores["home"][1] >= scores["away"][1] else "away"
+            live_val, total_val = scores[side]
+            if live_val < MIN_TEAM_PRESSURE:
+                continue
+            weight = total_val + (30 if fx["league_id"] in TOP_LEAGUE_IDS else 0)
+            candidates.append({
+                "fb": fb, "side": side, "stats": st, "pre": pre, "weight": weight,
+                "fid": fb["id"], "total": fb["hg"] + fb["ag"],
+            })
 
         if not candidates:
-            send_telegram_message(
-                "⚠️ Матчи на Фонбете есть, но по ним нет достаточной статистики моментов "
-                f"(порог {MIN_PRESSURE}) или статистика недоступна.")
+            send_telegram_message("⚠️ Матчи на Фонбете есть, но явного давления у какой-либо команды пока нет.")
             return
 
         candidates.sort(key=lambda x: x["weight"], reverse=True)
@@ -337,7 +322,6 @@ def search_top_matches():
             top.append(c)
             if len(top) == MAX_RESULTS:
                 break
-
         if not top:
             send_telegram_message("ℹ️ Новых сигналов нет — по найденным матчам уже отправлял.")
             return
@@ -345,24 +329,27 @@ def search_top_matches():
         send_telegram_message(f"✅ Найдено: <b>{len(top)}</b>")
         for c in top:
             sent_cache[c["fid"]] = c["total"]
-            fb = c["fb"]
-            home = html.escape(translate_name(fb["home"]))
-            away = html.escape(translate_name(fb["away"]))
-            s = c["stats"]
-            if s:
-                stat_line = (f"🎯 В створ: {s['on_target']} | Ударов: {s['shots']} | "
-                             f"Из штрафной: {s['inside_box']} | Угловые: {s['corners']}\n")
-            else:
-                stat_line = "📊 Статистика моментов недоступна\n"
+            fb, side, st, pre = c["fb"], c["side"], c["stats"], c["pre"]
+            home = translate_name(fb["home"])
+            away = translate_name(fb["away"])
+            team = home if side == "home" else away
+            me, opp = st[side], st["away" if side == "home" else "home"]
+            lines = [
+                f"🎯 Удары в створ: {me['on_target']} против {opp['on_target']}",
+                f"📐 Угловые: {me['corners']} против {opp['corners']}",
+                f"🥅 Удары из штрафной: {me['inside_box']} против {opp['inside_box']}",
+            ]
+            if pre and pre[side]:
+                lines.append(f"📊 Предматчевый прогноз: шансы на победу {pre['win'][side]}%, "
+                             f"преимущество по атаке и форме {int(pre[side])}%")
             msg = (
-                f"🔥 <b>ТОП-ПРОГНОЗ (LIVE, Фонбет)</b>\n\n"
-                f"⚽️ <b>{home}</b> — <b>{away}</b>\n"
+                f"🔥 <b>ВОЗМОЖЕН ГОЛ (LIVE)</b>\n\n"
+                f"⚽️ <b>{html.escape(home)}</b> — <b>{html.escape(away)}</b>\n"
                 f"🏆 {html.escape(fb['league'])}\n"
-                f"⏱ Минута: <b>{fb['minute']}'</b> | Счёт: <b>{fb['hg']}:{fb['ag']}</b>\n"
-                f"{stat_line}\n"
-                f"📌 Ставка: <b>ТБ {c['line']}</b>\n"
-                f"💰 Кф Фонбет: <b>{c['odd']}</b>\n\n"
-                f'🔗 <a href="https://www.fonbet.ru/live/football">Открыть Фонбет</a>'
+                f"⏱ Минута: <b>{fb['minute']}'</b> | Счёт: <b>{fb['hg']}:{fb['ag']}</b>\n\n"
+                f"👉 Возможно, гол забьёт: <b>{html.escape(team)}</b>\n\n"
+                + "\n".join(lines) +
+                f'\n\n🔗 <a href="https://www.fonbet.ru/live/football">Открыть Фонбет</a>'
             )
             send_telegram_message(msg)
     except Exception as e:
@@ -371,26 +358,16 @@ def search_top_matches():
 
 
 def debug_fonbet():
-    """/debug — проверка связи с Фонбетом и вывод id факторов для настройки."""
+    """/debug — проверка связи с Фонбетом."""
     try:
-        fb_list, factors = load_fonbet_live_football()
+        fb_list = load_fonbet_live_football()
     except Exception as e:
         send_telegram_message(f"❌ Фонбет не отвечает: <code>{html.escape(str(e))[:300]}</code>")
         return
-    with_totals = [x for x in fb_list if x["totals"]]
+    ok = [x for x in fb_list if x["minute"] is not None and x["minute"] <= MAX_MINUTE]
     send_telegram_message(
         f"📡 Live-футбола на Фонбете: <b>{len(fb_list)}</b>\n"
-        f"С найденными тоталами (id {sorted(FONBET_OVER_IDS)}): <b>{len(with_totals)}</b>")
-    if fb_list and not with_totals:
-        ev = fb_list[0]
-        rows = []
-        for f in factors.get(ev["id"], [])[:40]:
-            rows.append(f"f={f.get('f')} p={f.get('p')} pt={f.get('pt')} v={f.get('v')}")
-        send_telegram_message(
-            f"Тоталы не распознаны. Факторы матча {html.escape(ev['home'])} — "
-            f"{html.escape(ev['away'])}:\n<code>" + html.escape("\n".join(rows)) + "</code>\n\n"
-            "Найдите строки с p/pt вида 0.5, 1.5, 2.5 и задайте их f в переменной "
-            "FONBET_OVER_IDS (для «больше» — обычно меньший id из пары).")
+        f"Из них с минутой до {MAX_MINUTE}: <b>{len(ok)}</b>")
 
 
 def telegram_listener():
@@ -414,8 +391,9 @@ def telegram_listener():
                     debug_fonbet()
                 elif text in ("/start", "старт"):
                     send_telegram_message(
-                        "👋 Бот готов!\n\nНапишите <b>поиск</b> — найду лайв-матчи из линии Фонбета "
-                        f"с большим количеством моментов, кф ≥ {MIN_ODD}, до {MAX_MINUTE}-й минуты.\n"
+                        "👋 Бот готов!\n\nНапишите <b>поиск</b> — найду live-матчи на Фонбете до "
+                        f"{MAX_MINUTE}-й минуты и подскажу, какая команда может забить, "
+                        "по live-статистике и предматчевому прогнозу.\n"
                         "<b>/debug</b> — проверка связи с Фонбетом.")
         except Exception as e:
             print(f"Ошибка прослушки Telegram: {e}")
